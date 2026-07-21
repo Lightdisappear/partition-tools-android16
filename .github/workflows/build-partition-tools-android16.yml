@@ -16,7 +16,7 @@ env:
 jobs:
   build:
     # Must match the exact name of your GitHub-hosted larger runner.
-    runs-on: aosp-ubuntu-16core
+    runs-on: ubuntu-22.04
 
     timeout-minutes: 360
 
