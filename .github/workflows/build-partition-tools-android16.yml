@@ -12,18 +12,23 @@ permissions:
 
 env:
   AOSP_TAG: android-16.0.0_r4
-  AOSP_ROOT: ${{ runner.temp }}/aosp
-  AOSP_OUT: ${{ runner.temp }}/aosp-out
 
 jobs:
   build:
-    # GitHub-hosted larger runner—not self-hosted.
+    # Must match the exact name of your GitHub-hosted larger runner.
     runs-on: aosp-ubuntu-16core
 
-    # Maximum GitHub-hosted job execution time.
     timeout-minutes: 360
 
     steps:
+      - name: Configure temporary paths
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "AOSP_ROOT=$RUNNER_TEMP/aosp" >> "$GITHUB_ENV"
+          echo "AOSP_OUT=$RUNNER_TEMP/aosp-out" >> "$GITHUB_ENV"
+
       - name: Install build dependencies
         shell: bash
         run: |
@@ -107,7 +112,7 @@ jobs:
             exit 1
           fi
 
-          # Builds only lpmake and dependencies—not Android images.
+          # Only lpmake and its required dependencies are compiled.
           m -j"$(nproc)" lpmake
 
       - name: Package lpmake.exe
@@ -135,7 +140,7 @@ jobs:
             exit 1
           fi
 
-          PACKAGE="lpmake-${AOSP_TAG}-windows-x86_64"
+          PACKAGE="lpmake-${AOSP_TAG}-windows"
           PACKAGE_DIR="$GITHUB_WORKSPACE/dist/$PACKAGE"
           BIN_DIR="$(dirname "$EXE")"
 
@@ -144,7 +149,7 @@ jobs:
 
           cp "$EXE" "$PACKAGE_DIR/lpmake.exe"
 
-          # Runtime DLLs are installed beside the Windows host executable.
+          # Copy DLLs placed beside the executable.
           shopt -s nullglob
           DLLS=("$BIN_DIR"/*.dll)
 
