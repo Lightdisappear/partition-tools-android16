@@ -63,7 +63,8 @@ jobs:
             system/core \
             system/extras \
             system/libbase \
-            system/logging
+            system/logging \
+            system/tools/aidl
 
       - name: Build only partition_tools
         working-directory: aosp
