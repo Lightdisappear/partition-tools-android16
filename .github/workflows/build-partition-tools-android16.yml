@@ -31,7 +31,7 @@ jobs:
     # runner. Register a 64-bit Linux runner with the labels below and give it
     # at least 400 GB free disk and 64 GB RAM, or replace this with the label of
     # a GitHub larger runner having equivalent resources.
-    runs-on: [self-hosted, linux, x64, aosp]
+    runs-on: ubuntu-22.04
     timeout-minutes: 720
     env:
       AOSP_TAG: ${{ inputs.aosp_tag || 'android-16.0.0_r4' }}
