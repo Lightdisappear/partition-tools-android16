@@ -1,0 +1,302 @@
+name: Build Android 16 partition tools
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      aosp_tag:
+        description: "Pinned Android 16 AOSP tag"
+        required: true
+        default: "android-16.0.0_r4"
+        type: string
+      release_tag:
+        description: "GitHub Release tag to create or update"
+        required: true
+        default: "partition-tools-android-16.0.0_r4-1"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: partition-tools-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build AOSP host and host-cross tools
+    # A full AOSP checkout/build is too large for a standard GitHub-hosted
+    # runner. Register a 64-bit Linux runner with the labels below and give it
+    # at least 400 GB free disk and 64 GB RAM, or replace this with the label of
+    # a GitHub larger runner having equivalent resources.
+    runs-on: [self-hosted, linux, x64, aosp]
+    timeout-minutes: 720
+    env:
+      AOSP_TAG: ${{ inputs.aosp_tag || 'android-16.0.0_r4' }}
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+      AOSP_ROOT: ${{ runner.temp }}/aosp-${{ github.run_id }}-${{ github.run_attempt }}
+      DIST_DIR: ${{ runner.temp }}/partition-tools-dist
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          [[ "$AOSP_TAG" =~ ^android-16\.0\.0_r[0-9]+$ ]] || {
+            echo "Unsupported AOSP tag: $AOSP_TAG" >&2
+            exit 1
+          }
+          [[ "$RELEASE_TAG" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]] || {
+            echo "Unsafe release tag: $RELEASE_TAG" >&2
+            exit 1
+          }
+
+      - name: Install AOSP host packages
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            repo git-core gnupg flex bison build-essential zip curl \
+            zlib1g-dev libc6-dev-i386 x11proto-core-dev libx11-dev \
+            lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc unzip \
+            fontconfig file patchelf xz-utils
+          repo version
+
+      - name: Sync the pinned Android 16 source tree
+        run: |
+          set -euo pipefail
+          mkdir -p "$AOSP_ROOT"
+          cd "$AOSP_ROOT"
+
+          repo init \
+            -u https://android.googlesource.com/platform/manifest \
+            -b "$AOSP_TAG" \
+            --depth=1
+
+          repo sync \
+            -c \
+            --no-clone-bundle \
+            --no-tags \
+            --optimized-fetch \
+            --prune \
+            -j"$(nproc)"
+
+      - name: Build Linux tools and the supported Windows cross-target
+        run: |
+          set -euo pipefail
+          cd "$AOSP_ROOT"
+
+          # envsetup.sh and lunch are the supported entry points to Soong.
+          # This product choice does not change the host utility code.
+          set +u
+          source build/envsetup.sh
+          lunch aosp_arm64-trunk_staging-eng
+
+          # lpmake has target.windows.enabled=true upstream, so this one command
+          # builds both out/host/linux-x86/bin/lpmake and the Windows host-cross
+          # executable. The other modules below are upstream Linux-host tools.
+          m -j"$(nproc)" lpmake lpdump lpadd lpflash lpunpack
+
+      - name: Package Linux and Windows runtime files
+        run: |
+          set -euo pipefail
+
+          LINUX_HOST="$AOSP_ROOT/out/host/linux-x86"
+          WINDOWS_HOST="$AOSP_ROOT/out/host/windows-x86"
+          STAGE="$RUNNER_TEMP/partition-tools-stage"
+          LINUX_NAME="partition-tools-${AOSP_TAG}-linux-x86_64"
+          WINDOWS_NAME="lpmake-${AOSP_TAG}-windows-x86_64"
+          LINUX_PKG="$STAGE/$LINUX_NAME"
+          WINDOWS_PKG="$STAGE/$WINDOWS_NAME"
+
+          mkdir -p "$DIST_DIR" "$LINUX_PKG/bin" "$LINUX_PKG/lib64" "$WINDOWS_PKG"
+
+          # Copy the five upstream Linux host programs.
+          declare -a linux_sources=()
+          for tool in lpmake lpdump lpadd lpflash lpunpack; do
+            source_file="$LINUX_HOST/bin/$tool"
+            test -x "$source_file" || {
+              echo "Missing Linux output: $source_file" >&2
+              exit 1
+            }
+            cp "$source_file" "$LINUX_PKG/bin/$tool"
+            linux_sources+=("$source_file")
+          done
+
+          # Copy only AOSP-built shared-library dependencies, recursively.
+          # glibc and other operating-system libraries remain system-provided.
+          declare -A seen=()
+          declare -a queue=("${linux_sources[@]}")
+          while ((${#queue[@]})); do
+            current="${queue[0]}"
+            queue=("${queue[@]:1}")
+
+            while IFS= read -r dependency; do
+              [[ "$dependency" == "$AOSP_ROOT"/out/* ]] || continue
+              name="$(basename "$dependency")"
+              [[ -n "${seen[$name]:-}" ]] && continue
+              seen[$name]=1
+              cp -L "$dependency" "$LINUX_PKG/lib64/$name"
+              queue+=("$dependency")
+            done < <(
+              ldd "$current" 2>/dev/null | awk \
+                '/=> \// { print $3 } /^[[:space:]]*\// { print $1 }'
+            )
+          done
+
+          # Make the archive relocatable: executables find ../lib64, and copied
+          # libraries find siblings in their own directory.
+          while IFS= read -r executable; do
+            if patchelf --print-rpath "$executable" >/dev/null 2>&1; then
+              patchelf --set-rpath '$ORIGIN/../lib64' "$executable"
+            fi
+          done < <(find "$LINUX_PKG/bin" -maxdepth 1 -type f -print)
+
+          while IFS= read -r library; do
+            if patchelf --print-rpath "$library" >/dev/null 2>&1; then
+              patchelf --set-rpath '$ORIGIN' "$library"
+            fi
+          done < <(find "$LINUX_PKG/lib64" -maxdepth 1 -type f -print)
+
+          # The AOSP Windows cross-build installs lpmake.exe and its DLLs here.
+          test -f "$WINDOWS_HOST/bin/lpmake.exe" || {
+            echo "Missing Windows output: $WINDOWS_HOST/bin/lpmake.exe" >&2
+            exit 1
+          }
+          cp "$WINDOWS_HOST/bin/lpmake.exe" "$WINDOWS_PKG/"
+          while IFS= read -r dll; do
+            cp "$dll" "$WINDOWS_PKG/"
+          done < <(find "$WINDOWS_HOST/bin" -maxdepth 1 -type f -iname '*.dll' -print)
+
+          cat > "$LINUX_PKG/SOURCE.txt" <<EOF
+          AOSP tag: $AOSP_TAG
+          Source: https://android.googlesource.com/platform/system/extras/+/$AOSP_TAG/partition_tools/
+          Build: AOSP Soong Linux host variants
+          EOF
+
+          cat > "$WINDOWS_PKG/SOURCE.txt" <<EOF
+          AOSP tag: $AOSP_TAG
+          Source: https://android.googlesource.com/platform/system/extras/+/$AOSP_TAG/partition_tools/
+          Build: AOSP Soong Windows host-cross variant (lpmake only)
+          EOF
+
+          # Fail before publishing if a Linux archive would have a missing DLL.
+          for executable in "$LINUX_PKG"/bin/*; do
+            if ldd "$executable" | grep -q 'not found'; then
+              echo "Unresolved dependency in $executable" >&2
+              ldd "$executable" >&2
+              exit 1
+            fi
+            output="$($executable --help 2>&1 || true)"
+            grep -qi 'usage' <<<"$output" || {
+              echo "$executable did not produce usage output" >&2
+              echo "$output" >&2
+              exit 1
+            }
+          done
+
+          file "$WINDOWS_PKG/lpmake.exe"
+
+          tar -C "$STAGE" -cJf "$DIST_DIR/$LINUX_NAME.tar.xz" "$LINUX_NAME"
+          (
+            cd "$STAGE"
+            zip -9 -r "$DIST_DIR/$WINDOWS_NAME.zip" "$WINDOWS_NAME"
+          )
+
+          (
+            cd "$DIST_DIR"
+            sha256sum ./*.tar.xz ./*.zip > SHA256SUMS
+          )
+
+          cat > "$DIST_DIR/RELEASE_NOTES.md" <<EOF
+          Binaries built from the pinned AOSP tag \`$AOSP_TAG\`.
+
+          - Linux x86-64: \`lpmake\`, \`lpdump\`, \`lpadd\`, \`lpflash\`, and \`lpunpack\`
+          - Windows x86-64: upstream-supported \`lpmake.exe\`
+
+          Verify a download with \`SHA256SUMS\` before use.
+          EOF
+
+          ls -lh "$DIST_DIR"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: partition-tools-release-files
+          path: ${{ runner.temp }}/partition-tools-dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  test-windows:
+    name: Smoke-test lpmake on Windows
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - name: Download packaged binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: partition-tools-release-files
+          path: dist
+
+      - name: Run lpmake.exe natively
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem dist -Filter '*-windows-x86_64.zip' | Select-Object -First 1
+          if (-not $archive) { throw 'Windows archive was not downloaded' }
+
+          Expand-Archive -Path $archive.FullName -DestinationPath unpacked
+          $exe = Get-ChildItem unpacked -Recurse -Filter lpmake.exe | Select-Object -First 1
+          if (-not $exe) { throw 'lpmake.exe is missing from the archive' }
+
+          # --help intentionally returns EX_USAGE (1), so inspect its output
+          # instead of treating that documented exit code as a test failure.
+          if (Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+            $PSNativeCommandUseErrorActionPreference = $false
+          }
+          $output = & $exe.FullName --help 2>&1 | Out-String
+          if ($output -notmatch '(?i)usage') {
+            throw "lpmake.exe did not run correctly:`n$output"
+          }
+          Write-Host $output
+          $global:LASTEXITCODE = 0
+
+  release:
+    name: Publish GitHub Release
+    needs: [build, test-windows]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@v8
+        with:
+          name: partition-tools-release-files
+          path: dist
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              dist/*.tar.xz dist/*.zip dist/SHA256SUMS \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" \
+              dist/*.tar.xz dist/*.zip dist/SHA256SUMS \
+              --target "$GITHUB_SHA" \
+              --title "Android 16 partition tools ($RELEASE_TAG)" \
+              --notes-file dist/RELEASE_NOTES.md \
+              --repo "$GITHUB_REPOSITORY"
+          fi
