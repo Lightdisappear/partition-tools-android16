@@ -51,6 +51,7 @@ jobs:
             external/golang-protobuf \
             external/libcxx \
             external/libcxxabi \
+            external/pogreb \
             external/protobuf \
             external/starlark-go \
             external/zlib \
