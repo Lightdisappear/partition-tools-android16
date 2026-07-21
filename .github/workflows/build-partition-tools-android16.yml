@@ -19,8 +19,14 @@ jobs:
     steps:
       - name: Install repo
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends repo
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            -o "$HOME/bin/repo"
+          chmod a+rx "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/repo" version
 
       - name: Download only the required AOSP projects
         run: |
