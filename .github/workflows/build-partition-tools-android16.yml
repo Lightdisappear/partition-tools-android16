@@ -1,11 +1,9 @@
-name: Build Android 16 lpmake for Windows
+name: Build Android 16 partition tools
 
 on:
   workflow_dispatch:
-
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
 
 permissions:
   contents: write
@@ -15,177 +13,136 @@ env:
 
 jobs:
   build:
-    # Must match the exact name of your GitHub-hosted larger runner.
-    runs-on: ubuntu-22.04
-
-    timeout-minutes: 360
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
 
     steps:
-      - name: Configure temporary paths
-        shell: bash
+      - name: Install repo
         run: |
-          set -euo pipefail
-
-          echo "AOSP_ROOT=$RUNNER_TEMP/aosp" >> "$GITHUB_ENV"
-          echo "AOSP_OUT=$RUNNER_TEMP/aosp-out" >> "$GITHUB_ENV"
-
-      - name: Install build dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-
           sudo apt-get update
+          sudo apt-get install -y --no-install-recommends repo
 
-          sudo apt-get install -y \
-            git-core \
-            gnupg \
-            flex \
-            bison \
-            build-essential \
-            zip \
-            curl \
-            zlib1g-dev \
-            libc6-dev-i386 \
-            lib32z1-dev \
-            libgl1-mesa-dev \
-            libxml2-utils \
-            xsltproc \
-            unzip \
-            fontconfig \
-            python3 \
-            rsync \
-            file
-
-          mkdir -p "$HOME/bin"
-
-          curl -fsSL \
-            https://storage.googleapis.com/git-repo-downloads/repo \
-            -o "$HOME/bin/repo"
-
-          chmod +x "$HOME/bin/repo"
-
-          "$HOME/bin/repo" version
-
-      - name: Sync Android 16 source
-        shell: bash
+      - name: Download only the required AOSP projects
         run: |
           set -euo pipefail
+          mkdir aosp
+          cd aosp
+          repo init -u https://android.googlesource.com/platform/manifest \
+            -b "$AOSP_TAG" --depth=1
 
-          mkdir -p "$AOSP_ROOT" "$AOSP_OUT"
-          cd "$AOSP_ROOT"
+          repo sync -c -j4 --no-clone-bundle --no-tags \
+            build/blueprint \
+            build/make \
+            build/release \
+            build/soong \
+            bionic \
+            external/abseil-cpp \
+            external/boringssl \
+            external/compiler-rt \
+            external/e2fsprogs \
+            external/fmtlib \
+            external/go-cmp \
+            external/golang-protobuf \
+            external/libcxx \
+            external/libcxxabi \
+            external/protobuf \
+            external/starlark-go \
+            external/zlib \
+            prebuilts/build-tools \
+            prebuilts/clang/host/linux-x86 \
+            prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8 \
+            prebuilts/gcc/linux-x86/host/x86_64-w64-mingw32-4.8 \
+            prebuilts/go/linux-x86 \
+            system/core \
+            system/extras \
+            system/libbase \
+            system/logging
 
-          "$HOME/bin/repo" init \
-            -u https://android.googlesource.com/platform/manifest \
-            -b "$AOSP_TAG" \
-            --partial-clone \
-            --clone-filter=blob:limit=10M \
-            --no-use-superproject
-
-          "$HOME/bin/repo" sync \
-            -c \
-            -j8 \
-            --no-clone-bundle \
-            --prune \
-            --fail-fast \
-            --retry-fetches=3
-
-      - name: Build only lpmake for Windows
-        shell: bash
+      - name: Build only partition_tools
+        working-directory: aosp
         run: |
           set -euo pipefail
+          mkdir -p out/soong
+          printf '%s\n' \
+            '{' \
+            '  "Allow_missing_dependencies": true,' \
+            '  "HostArch": "x86_64",' \
+            '  "CrossHost": "windows",' \
+            '  "CrossHostArch": "x86_64"' \
+            '}' > out/soong/soong.variables
 
-          cd "$AOSP_ROOT"
+          LINUX=out/soong/host/linux-x86/bin
+          WINDOWS=out/soong/host/windows-x86/bin
 
-          export OUT_DIR="$AOSP_OUT"
+          build/soong/soong_ui.bash --make-mode --skip-make -j2 \
+            "$LINUX/lpmake" \
+            "$LINUX/lpdump" \
+            "$LINUX/lpadd" \
+            "$LINUX/lpflash" \
+            "$LINUX/lpunpack" \
+            "$WINDOWS/lpmake.exe"
 
-          source build/envsetup.sh
-
-          lunch \
-            aosp_cf_x86_64_phone-trunk_staging-userdebug
-
-          HOST_CROSS_OS_VALUE="$(get_build_var HOST_CROSS_OS)"
-
-          echo "HOST_CROSS_OS=$HOST_CROSS_OS_VALUE"
-
-          if [[ "$HOST_CROSS_OS_VALUE" != "windows" ]]; then
-            echo "::error::Windows cross-compilation is not enabled."
-            exit 1
-          fi
-
-          # Only lpmake and its required dependencies are compiled.
-          m -j"$(nproc)" lpmake
-
-      - name: Package lpmake.exe
-        id: package
-        shell: bash
+      - name: Test and package
         run: |
           set -euo pipefail
+          VERSION="partition-tools-$AOSP_TAG"
+          WINDOWS_NAME="lpmake-$AOSP_TAG-windows-x86_64"
+          LINUX_OUT=aosp/out/soong/host/linux-x86
+          WINDOWS_OUT=aosp/out/soong/host/windows-x86
+          LINUX_DIR="dist/$VERSION-linux-x86_64"
+          WINDOWS_DIR="dist/$WINDOWS_NAME"
 
-          EXE="$(
-            find "$AOSP_OUT/host" \
-              -type f \
-              -path "*/bin/lpmake.exe" \
-              -print \
-              -quit
-          )"
+          mkdir -p "$LINUX_DIR/bin" "$WINDOWS_DIR"
+          cp -a "$LINUX_OUT/lib64" "$LINUX_DIR/"
 
-          if [[ -z "$EXE" || ! -f "$EXE" ]]; then
-            echo "::error::lpmake.exe was not found."
+          for tool in lpmake lpdump lpadd lpflash lpunpack; do
+            test -x "$LINUX_OUT/bin/$tool"
+            cp "$LINUX_OUT/bin/$tool" "$LINUX_DIR/bin/"
+            output="$("$LINUX_DIR/bin/$tool" --help 2>&1 || true)"
+            grep -qi usage <<<"$output"
+          done
 
-            find "$AOSP_OUT/host" \
-              -type f \
-              \( -name "*.exe" -o -name "*.dll" \) \
-              -print 2>/dev/null || true
+          test -f "$WINDOWS_OUT/bin/lpmake.exe"
+          cp "$WINDOWS_OUT/bin/lpmake.exe" "$WINDOWS_DIR/"
+          find "$WINDOWS_OUT/bin" -maxdepth 1 -iname '*.dll' \
+            -exec cp {} "$WINDOWS_DIR/" \;
+          file "$WINDOWS_DIR/lpmake.exe" | grep -q 'PE32+'
 
-            exit 1
-          fi
+          printf 'Built from AOSP %s\n' "$AOSP_TAG" \
+            | tee "$LINUX_DIR/SOURCE.txt" "$WINDOWS_DIR/SOURCE.txt"
 
-          PACKAGE="lpmake-${AOSP_TAG}-windows"
-          PACKAGE_DIR="$GITHUB_WORKSPACE/dist/$PACKAGE"
-          BIN_DIR="$(dirname "$EXE")"
+          tar -C dist -cJf "dist/$VERSION-linux-x86_64.tar.xz" \
+            "$VERSION-linux-x86_64"
+          (cd dist && zip -9 -qr "$WINDOWS_NAME.zip" "$WINDOWS_NAME")
+          (cd dist && sha256sum ./*.tar.xz ./*.zip > SHA256SUMS)
 
-          rm -rf "$GITHUB_WORKSPACE/dist"
-          mkdir -p "$PACKAGE_DIR"
+          cat > dist/RELEASE_NOTES.md <<EOF
+          Android 16 partition tools built from AOSP $AOSP_TAG.
 
-          cp "$EXE" "$PACKAGE_DIR/lpmake.exe"
-
-          # Copy DLLs placed beside the executable.
-          shopt -s nullglob
-          DLLS=("$BIN_DIR"/*.dll)
-
-          if (( ${#DLLS[@]} > 0 )); then
-            cp "${DLLS[@]}" "$PACKAGE_DIR/"
-          fi
-
-          file "$PACKAGE_DIR/lpmake.exe"
-
-          cd "$GITHUB_WORKSPACE/dist"
-
-          zip -9 -r \
-            "$PACKAGE.zip" \
-            "$PACKAGE"
-
-          sha256sum \
-            "$PACKAGE.zip" \
-            > "$PACKAGE.zip.sha256"
-
-          echo "package=$PACKAGE" >> "$GITHUB_OUTPUT"
+          Linux/WSL: lpmake, lpdump, lpadd, lpflash and lpunpack.
+          Native Windows: lpmake.exe (the only Windows target enabled upstream).
+          EOF
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.package.outputs.package }}
+          name: partition-tools-${{ env.AOSP_TAG }}
           path: |
-            dist/${{ steps.package.outputs.package }}.zip
-            dist/${{ steps.package.outputs.package }}.zip.sha256
+            dist/*.tar.xz
+            dist/*.zip
+            dist/SHA256SUMS
           if-no-files-found: error
 
-      - name: Publish GitHub Release
+      - name: Upload GitHub Release assets
         if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v3
-        with:
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
-            dist/${{ steps.package.outputs.package }}.zip
-            dist/${{ steps.package.outputs.package }}.zip.sha256
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          assets=(dist/*.tar.xz dist/*.zip dist/SHA256SUMS)
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --title "$GITHUB_REF_NAME" --notes-file dist/RELEASE_NOTES.md
+          fi
