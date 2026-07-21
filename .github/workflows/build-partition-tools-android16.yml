@@ -66,6 +66,69 @@ jobs:
             system/logging \
             system/tools/aidl
 
+      - name: Link partition tools statically
+        working-directory: aosp
+        run: |
+          set -euo pipefail
+
+          git -C system/extras apply --unidiff-zero <<'PATCH'
+          diff --git a/partition_tools/Android.bp b/partition_tools/Android.bp
+          --- a/partition_tools/Android.bp
+          +++ b/partition_tools/Android.bp
+          @@ -35 +35 @@
+          -cc_library_shared {
+          +cc_library {
+          @@ -39 +39 @@
+          -    shared_libs: [
+          +    static_libs: [
+          @@ -40,0 +41 @@
+          +        "libjsonpbparse",
+          @@ -45,3 +45,0 @@
+          -    static_libs: [
+          -        "libjsonpbparse",
+          -    ],
+          @@ -70 +68,2 @@
+          -    shared_libs: [
+          +    static_executable: true,
+          +    static_libs: [
+          @@ -71,0 +71 @@
+          +        "libjsonpbparse",
+          @@ -75,3 +74,0 @@
+          -    static_libs: [
+          -        "libjsonpbparse",
+          -    ],
+          @@ -96 +93 @@
+          -            shared_libs: [
+          +            static_libs: [
+          @@ -106 +103,2 @@
+          -    shared_libs: [
+          +    static_executable: true,
+          +    static_libs: [
+          @@ -124 +122,2 @@
+          -    shared_libs: [
+          +    static_executable: true,
+          +    static_libs: [
+          @@ -139 +138,2 @@
+          -    shared_libs: [
+          +    static_executable: true,
+          +    static_libs: [
+          @@ -179 +179,2 @@
+          -    shared_libs: [
+          +    static_executable: true,
+          +    static_libs: [
+          PATCH
+
+          git -C system/core apply --unidiff-zero <<'PATCH'
+          diff --git a/fs_mgr/liblp/Android.bp b/fs_mgr/liblp/Android.bp
+          --- a/fs_mgr/liblp/Android.bp
+          +++ b/fs_mgr/liblp/Android.bp
+          @@ -51,2 +51,2 @@
+          -    shared_libs: [
+          -        "libcrypto",
+          +    static_libs: [
+          +        "libcrypto_static",
+          PATCH
+
       - name: Build only partition_tools
         working-directory: aosp
         run: |
@@ -96,28 +159,35 @@ jobs:
       - name: Test and package
         run: |
           set -euo pipefail
-          VERSION="partition-tools-$AOSP_TAG"
-          WINDOWS_NAME="lpmake-$AOSP_TAG-windows-x86_64"
+          VERSION="partition-tools-$AOSP_TAG-static"
+          WINDOWS_NAME="lpmake-$AOSP_TAG-windows-x86_64-static"
           LINUX_OUT=aosp/out/host/linux-x86
           WINDOWS_OUT=aosp/out/host/windows-x86
           LINUX_DIR="dist/$VERSION-linux-x86_64"
           WINDOWS_DIR="dist/$WINDOWS_NAME"
 
           mkdir -p "$LINUX_DIR/bin" "$WINDOWS_DIR"
-          cp -a "$LINUX_OUT/lib64" "$LINUX_DIR/"
 
           for tool in lpmake lpdump lpadd lpflash lpunpack; do
             test -x "$LINUX_OUT/bin/$tool"
             cp "$LINUX_OUT/bin/$tool" "$LINUX_DIR/bin/"
+            file "$LINUX_DIR/bin/$tool" | grep -q 'statically linked'
             output="$("$LINUX_DIR/bin/$tool" --help 2>&1 || true)"
             grep -qi usage <<<"$output"
           done
 
           test -f "$WINDOWS_OUT/bin/lpmake.exe"
           cp "$WINDOWS_OUT/bin/lpmake.exe" "$WINDOWS_DIR/"
-          find "$WINDOWS_OUT/bin" -maxdepth 1 -iname '*.dll' \
-            -exec cp {} "$WINDOWS_DIR/" \;
           file "$WINDOWS_DIR/lpmake.exe" | grep -q 'PE32+'
+          objdump -p "$WINDOWS_DIR/lpmake.exe" \
+            | sed -n 's/^[[:space:]]*DLL Name: //p' \
+            | tee "$WINDOWS_DIR/IMPORTS.txt"
+          if grep -Eqi \
+            'lib(base|log|lp|protobuf|crypto|ssl|z|c\+\+|winpthread|gcc).*\.dll' \
+            "$WINDOWS_DIR/IMPORTS.txt"; then
+            echo 'Windows binary still imports a non-system runtime DLL' >&2
+            exit 1
+          fi
 
           printf 'Built from AOSP %s\n' "$AOSP_TAG" \
             | tee "$LINUX_DIR/SOURCE.txt" "$WINDOWS_DIR/SOURCE.txt"
@@ -130,14 +200,15 @@ jobs:
           cat > dist/RELEASE_NOTES.md <<EOF
           Android 16 partition tools built from AOSP $AOSP_TAG.
 
-          Linux/WSL: lpmake, lpdump, lpadd, lpflash and lpunpack.
-          Native Windows: lpmake.exe (the only Windows target enabled upstream).
+          Linux/WSL: statically linked lpmake, lpdump, lpadd, lpflash and lpunpack.
+          Native Windows: lpmake.exe with AOSP libraries linked statically.
+          Windows system DLL imports are listed in IMPORTS.txt.
           EOF
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
         with:
-          name: partition-tools-${{ env.AOSP_TAG }}
+          name: partition-tools-static-${{ env.AOSP_TAG }}
           path: |
             dist/*.tar.xz
             dist/*.zip
