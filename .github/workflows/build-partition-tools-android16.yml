@@ -75,44 +75,53 @@ jobs:
           diff --git a/partition_tools/Android.bp b/partition_tools/Android.bp
           --- a/partition_tools/Android.bp
           +++ b/partition_tools/Android.bp
-          @@ -35 +35 @@
+          @@ -27,0 +28,7 @@
+          +    static_libs: [
+          +        "libcrypto",
+          +        "libcrypto_utils",
+          +        "libext4_utils",
+          +        "libsparse",
+          +        "libz",
+          +    ],
+          @@ -35 +42 @@
           -cc_library_shared {
           +cc_library {
-          @@ -39 +39 @@
+          @@ -39 +46 @@
           -    shared_libs: [
           +    static_libs: [
-          @@ -40,0 +41 @@
+          @@ -40,0 +48 @@
           +        "libjsonpbparse",
-          @@ -45,3 +45,0 @@
+          @@ -45,3 +52,0 @@
           -    static_libs: [
           -        "libjsonpbparse",
           -    ],
-          @@ -70 +68,2 @@
+          @@ -70 +75,2 @@
           -    shared_libs: [
           +    static_executable: true,
           +    static_libs: [
-          @@ -71,0 +71 @@
+          @@ -71,0 +78 @@
           +        "libjsonpbparse",
-          @@ -75,3 +74,0 @@
+          @@ -74,3 +81 @@
+          -    ],
           -    static_libs: [
           -        "libjsonpbparse",
-          -    ],
-          @@ -96 +93 @@
+          +        "libprotobuf-cpp-full",
+          @@ -96 +101 @@
           -            shared_libs: [
           +            static_libs: [
-          @@ -106 +103,2 @@
+          @@ -106 +111,2 @@
           -    shared_libs: [
           +    static_executable: true,
           +    static_libs: [
-          @@ -124 +122,2 @@
+          @@ -124 +130,2 @@
           -    shared_libs: [
           +    static_executable: true,
           +    static_libs: [
-          @@ -139 +138,2 @@
+          @@ -139 +146,2 @@
           -    shared_libs: [
           +    static_executable: true,
           +    static_libs: [
-          @@ -179 +179,2 @@
+          @@ -179 +187,2 @@
           -    shared_libs: [
           +    static_executable: true,
           +    static_libs: [
@@ -122,11 +131,23 @@ jobs:
           diff --git a/fs_mgr/liblp/Android.bp b/fs_mgr/liblp/Android.bp
           --- a/fs_mgr/liblp/Android.bp
           +++ b/fs_mgr/liblp/Android.bp
-          @@ -51,2 +51,2 @@
+          @@ -51 +51 @@
           -    shared_libs: [
-          -        "libcrypto",
           +    static_libs: [
-          +        "libcrypto_static",
+          diff --git a/libsparse/Android.bp b/libsparse/Android.bp
+          --- a/libsparse/Android.bp
+          +++ b/libsparse/Android.bp
+          @@ -26 +26 @@
+          -    shared_libs: [
+          +    static_libs: [
+          @@ -45,0 +46 @@
+          +    static_executable: true,
+          @@ -53,0 +55 @@
+          +        "liblog",
+          @@ -58,0 +61,3 @@
+          +            enabled: true,
+          +        },
+          +        windows: {
           PATCH
 
       - name: Build only partition_tools
@@ -154,13 +175,15 @@ jobs:
             "$LINUX/lpadd" \
             "$LINUX/lpflash" \
             "$LINUX/lpunpack" \
-            "$WINDOWS/lpmake.exe"
+            "$LINUX/simg2img" \
+            "$WINDOWS/lpmake.exe" \
+            "$WINDOWS/simg2img.exe"
 
       - name: Test and package
         run: |
           set -euo pipefail
           VERSION="partition-tools-$AOSP_TAG-static"
-          WINDOWS_NAME="lpmake-$AOSP_TAG-windows-x86_64-static"
+          WINDOWS_NAME="partition-tools-$AOSP_TAG-windows-x86_64-static"
           LINUX_OUT=aosp/out/host/linux-x86
           WINDOWS_OUT=aosp/out/host/windows-x86
           LINUX_DIR="dist/$VERSION-linux-x86_64"
@@ -168,7 +191,7 @@ jobs:
 
           mkdir -p "$LINUX_DIR/bin" "$WINDOWS_DIR"
 
-          for tool in lpmake lpdump lpadd lpflash lpunpack; do
+          for tool in lpmake lpdump lpadd lpflash lpunpack simg2img; do
             test -x "$LINUX_OUT/bin/$tool"
             cp "$LINUX_OUT/bin/$tool" "$LINUX_DIR/bin/"
             file "$LINUX_DIR/bin/$tool" | grep -q 'statically linked'
@@ -176,12 +199,16 @@ jobs:
             grep -qi usage <<<"$output"
           done
 
-          test -f "$WINDOWS_OUT/bin/lpmake.exe"
-          cp "$WINDOWS_OUT/bin/lpmake.exe" "$WINDOWS_DIR/"
-          file "$WINDOWS_DIR/lpmake.exe" | grep -q 'PE32+'
-          objdump -p "$WINDOWS_DIR/lpmake.exe" \
-            | sed -n 's/^[[:space:]]*DLL Name: //p' \
-            | tee "$WINDOWS_DIR/IMPORTS.txt"
+          : > "$WINDOWS_DIR/IMPORTS.txt"
+          for tool in lpmake simg2img; do
+            test -f "$WINDOWS_OUT/bin/$tool.exe"
+            cp "$WINDOWS_OUT/bin/$tool.exe" "$WINDOWS_DIR/"
+            file "$WINDOWS_DIR/$tool.exe" | grep -q 'PE32+'
+            printf '[%s.exe]\n' "$tool" >> "$WINDOWS_DIR/IMPORTS.txt"
+            objdump -p "$WINDOWS_DIR/$tool.exe" \
+              | sed -n 's/^[[:space:]]*DLL Name: //p' \
+              >> "$WINDOWS_DIR/IMPORTS.txt"
+          done
           if grep -Eqi \
             'lib(base|log|lp|protobuf|crypto|ssl|z|c\+\+|winpthread|gcc).*\.dll' \
             "$WINDOWS_DIR/IMPORTS.txt"; then
@@ -200,8 +227,8 @@ jobs:
           cat > dist/RELEASE_NOTES.md <<EOF
           Android 16 partition tools built from AOSP $AOSP_TAG.
 
-          Linux/WSL: statically linked lpmake, lpdump, lpadd, lpflash and lpunpack.
-          Native Windows: lpmake.exe with AOSP libraries linked statically.
+          Linux/WSL: statically linked lpmake, lpdump, lpadd, lpflash, lpunpack and simg2img.
+          Native Windows: lpmake.exe and simg2img.exe with AOSP libraries linked statically.
           Windows system DLL imports are listed in IMPORTS.txt.
           EOF
 
